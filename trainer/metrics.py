@@ -461,7 +461,8 @@ class WandbMonitor:
         if a.diag_interval > 0 and self.opt_step % a.diag_interval == 0:
             self.run.log(self._diagnostics(input_ids, labels, lr), step=self.micro_step)
         if self.eval_idx and a.eval_interval > 0 and self.opt_step % a.eval_interval == 0:
-            self.run.log(eval_split(self.model, self.val_ds, self.eval_idx, a.batch_size,
+            self.run.log(eval_split(self.model, self.val_ds, self.eval_idx,
+                                    min(a.batch_size, 32),  # probes run eager — cap the activation spike
                                     self.device, self.autocast_ctx, a.eval_batches),
                          step=self.micro_step)
         if a.showcase_interval > 0 and self.opt_step % a.showcase_interval == 0:
