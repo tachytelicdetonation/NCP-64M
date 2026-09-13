@@ -105,6 +105,9 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--ckpt', type=str, default='', help='NCP checkpoint .pth')
     p.add_argument('--hf_model', type=str, default='', help='HF model id/path for comparison')
+    p.add_argument('--minimind_ckpt', type=str, default='',
+                   help='minimind .pth (e.g. pretrain_768.pth from jingyaogong/minimind-3-pytorch); '
+                        'clones the minimind repo for its model class')
     p.add_argument('--tasks', nargs='*', default=list(TASKS))
     p.add_argument('--limit', type=int, default=400)
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else
@@ -116,7 +119,19 @@ def main():
     args = p.parse_args()
 
     from transformers import AutoTokenizer
-    if args.hf_model:
+    if args.minimind_ckpt:
+        import subprocess
+        if not os.path.exists('/tmp/minimind_repo'):
+            subprocess.run(['git', 'clone', '-q', '--depth', '1',
+                            'https://github.com/jingyaogong/minimind', '/tmp/minimind_repo'], check=True)
+        sys.path.insert(0, '/tmp/minimind_repo')
+        from model.model_minimind import MiniMindForCausalLM, MiniMindConfig
+        tok = AutoTokenizer.from_pretrained('/tmp/minimind_repo/model')
+        model = MiniMindForCausalLM(MiniMindConfig(hidden_size=768, num_hidden_layers=8))
+        model.load_state_dict(torch.load(args.minimind_ckpt, map_location=args.device), strict=True)
+        model = model.to(args.device).eval()
+        fwd = lambda x: model(x).logits
+    elif args.hf_model:
         tok = AutoTokenizer.from_pretrained(args.hf_model)
         from transformers import AutoModelForCausalLM
         model = AutoModelForCausalLM.from_pretrained(
