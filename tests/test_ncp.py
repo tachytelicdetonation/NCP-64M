@@ -112,3 +112,40 @@ def test_generate_runs():
     x = ids(1)[:, :8]
     out = model.generate(input_ids=x, max_new_tokens=9, do_sample=False, eos_token_id=None)
     assert out.shape[1] == 17
+
+def test_concept_history_override_reaches_decoder():
+    """A supplied concept history (Sec. 2.3 inference path) must change the
+    decoder input — proves the override is wired through, not ignored."""
+    model = make_model()
+    x = ids(1)
+    m = T // K
+    fake = torch.zeros(1, m, model.config.hidden_size)
+    with torch.no_grad():
+        l1 = model(x)['logits']
+        l2 = model(x, concept_history=fake)['logits']
+    assert not torch.allclose(l1, l2)
+    assert torch.allclose(l1[:, :K], l2[:, :K], atol=1e-6), "first chunk has no concept signal to override"
+
+def test_generate_predicted_concept_feedback():
+    """Paper-style generation: the CM's history is its own predictions. Must run
+    end-to-end and be deterministic under greedy decoding."""
+    model = make_model()
+    x = ids(1)[:, :8]
+    kw = dict(max_new_tokens=9, do_sample=False, eos_token_id=None, concept_feedback='predicted')
+    out1 = model.generate(input_ids=x, **kw)
+    out2 = model.generate(input_ids=x, **kw)
+    assert out1.shape[1] == 17 and torch.equal(out1, out2)
+
+def test_vq_only_optimizer_sees_only_vq_params():
+    """Sec. 5.1 adaptation: with the backbone frozen, optimizers must cover
+    exactly the codebook + prediction heads."""
+    from types import SimpleNamespace
+    from trainer.trainer_utils import build_optimizers
+    model = make_model()
+    for n, p in model.named_parameters():
+        p.requires_grad = 'quantizer' in n
+    for opt_name in ('adamw', 'muon'):
+        args = SimpleNamespace(optimizer=opt_name, learning_rate=1e-3, weight_decay=0.0)
+        trained = {id(p) for opt in build_optimizers(model, args) for g in opt.param_groups for p in g['params']}
+        expected = {id(p) for n, p in model.named_parameters() if 'quantizer' in n}
+        assert trained == expected

@@ -40,6 +40,8 @@ def main():
     parser.add_argument('--max_new_tokens', default=256, type=int)
     parser.add_argument('--temperature', default=0.85, type=float)
     parser.add_argument('--top_p', default=0.95, type=float)
+    parser.add_argument('--concept_feedback', default='predicted', choices=['predicted', 'pooled'],
+                        help="predicted = paper Sec. 2.3 (CM consumes its own predictions); pooled = teacher-forced encoder concepts")
     parser.add_argument('--show_speed', default=1, type=int)
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'), type=str)
     args = parser.parse_args()
@@ -67,6 +69,7 @@ def main():
             input_ids=inputs["input_ids"], max_new_tokens=args.max_new_tokens,
             do_sample=True, eos_token_id=tokenizer.eos_token_id,
             top_p=args.top_p, temperature=args.temperature,
+            concept_feedback=args.concept_feedback,
         )
         response = tokenizer.decode(generated_ids[0][len(inputs["input_ids"][0]):], skip_special_tokens=True)
         print(response)

@@ -122,6 +122,8 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str, default="./dataset/pretrain.bin")
     parser.add_argument('--from_weight', default='none', type=str)
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1])
+    parser.add_argument('--train_vq_only', default=0, type=int, choices=[0, 1],
+                        help="Sec. 5.1: freeze the backbone and train only VQ codebooks + concept-prediction heads (use with --from_weight)")
     args = parser.parse_args()
 
     # ========== 1. seed ==========
@@ -150,6 +152,12 @@ if __name__ == "__main__":
 
     # ========== 4. model, data, optimizers ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device, save_dir=args.save_dir)
+    if args.train_vq_only:
+        assert args.arch == 'ncp', '--train_vq_only requires --arch ncp'
+        for name, p in model.named_parameters():
+            p.requires_grad = 'quantizer' in name
+        Logger(f'VQ-only adaptation: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M '
+               'trainable (codebooks + prediction heads)')
     train_ds = PretrainDataset(args.data_path, seq_len=args.max_seq_len)
     loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                         num_workers=args.num_workers, pin_memory=False, drop_last=True)

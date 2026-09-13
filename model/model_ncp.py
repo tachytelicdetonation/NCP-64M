@@ -319,7 +319,7 @@ class NCPModel(nn.Module):
         out = concept_states[:, idx] * valid.view(1, t, 1).type_as(concept_states)
         return out
 
-    def forward(self, input_ids, attention_mask=None, **kwargs):
+    def forward(self, input_ids, attention_mask=None, concept_history=None, **kwargs):
         B, T = input_ids.shape
         position_embeddings = (self.freqs_cos[:T], self.freqs_sin[:T])
         x = self.dropout(self.embed_tokens(input_ids))
@@ -335,7 +335,7 @@ class NCPModel(nn.Module):
         if m == 0:  # sequence shorter than one chunk: no concept signal yet
             h_dec, _ = self.token_decoder(h, position_embeddings, crc_inputs=None, attention_mask=attention_mask)
             z = h.new_zeros(())
-            return self.norm(h_dec), {'loss_ncp': z, 'loss_vq': z}
+            return self.norm(h_dec), {'loss_ncp': z, 'loss_vq': z, 'chat': None, 'concepts': None}
 
         # 2. continuous concepts + VQ (Eq. 2-6); concepts are RMS-normalized to a
         # fixed scale before quantization, prediction, and feedback
@@ -343,10 +343,14 @@ class NCPModel(nn.Module):
         d_quant, code_idx = self.quantizer.quantize(c)
         vq_loss = (d_quant - c.detach()).pow(2).mean()
 
-        # 3. Concept Module predicts next concept (Eq. 7-10); Enc->CM CRC states are chunk-pooled
+        # 3. Concept Module predicts next concept (Eq. 7-10); Enc->CM CRC states are chunk-pooled.
+        # concept_history overrides the pooled-concept CM input — the paper's
+        # autoregressive inference feeds back predicted concepts (Sec. 2.3).
+        cm_in = c if concept_history is None else concept_history
+        assert cm_in.shape[1] == m, "concept_history must cover exactly the m complete chunks"
         cm_crc = {'enc': [self.mean_pool(s, m) for s in xs_enc[1:]]} if self.config.use_crc else None
         u, xs_cm = self.concept_module(
-            c, (self.freqs_cos[:m], self.freqs_sin[:m]), crc_inputs=cm_crc
+            cm_in, (self.freqs_cos[:m], self.freqs_sin[:m]), crc_inputs=cm_crc
         )
         chat, pi = self.quantizer.predict(u)                                       # chat[:, j] predicts c[:, j+1]
         ncp_loss = (chat[:, :-1] - c[:, 1:].detach()).pow(2).mean() if m > 1 else c.new_zeros(())
@@ -363,7 +367,7 @@ class NCPModel(nn.Module):
                 'cm': [self.causal_repeat(s, T) for s in xs_cm[1:]],
             }
         h_dec, _ = self.token_decoder(h_tilde, position_embeddings, crc_inputs=dec_crc, attention_mask=attention_mask)
-        return self.norm(h_dec), {'loss_ncp': ncp_loss, 'loss_vq': vq_loss}
+        return self.norm(h_dec), {'loss_ncp': ncp_loss, 'loss_vq': vq_loss, 'chat': chat, 'concepts': c}
 
 class NCPForCausalLM(PreTrainedModel):
     config_class = NCPConfig
@@ -400,17 +404,35 @@ class NCPForCausalLM(PreTrainedModel):
             if 'loss_ncp' in losses: loss = loss + self.config.ncp_loss_weight * losses['loss_ncp']
             if 'loss_vq' in losses: loss = loss + self.config.vq_loss_weight * losses['loss_vq']
         return {'loss': loss, 'loss_ntp': loss_ntp, 'loss_ncp': losses.get('loss_ncp'),
-                'loss_vq': losses.get('loss_vq'), 'logits': logits, 'hidden_states': hidden_states}
+                'loss_vq': losses.get('loss_vq'), 'logits': logits, 'hidden_states': hidden_states,
+                'chat': losses.get('chat'), 'concepts': losses.get('concepts')}
 
     @torch.inference_mode()
     def generate(self, input_ids=None, max_new_tokens=512, temperature=0.85, top_p=0.85, top_k=50,
-                 eos_token_id=2, do_sample=True, repetition_penalty=1.0, **kwargs):
-        # full forward per step: each call recomputes the concept path on the grown sequence,
-        # so predicted concepts for the chunk under generation are always conditioned on
-        # concepts pooled from fully completed chunks only (Eq. 11 causality)
+                 eos_token_id=2, do_sample=True, repetition_penalty=1.0, concept_feedback='predicted', **kwargs):
+        # full forward per step (no KV cache). concept_feedback='predicted' follows the
+        # paper (Sec. 2.3): during generation the Concept Module's history is its own
+        # past predictions. Position 0 stays the real pooled concept c_0 (nothing
+        # predicts concept 0); each ĉ_l is appended when chunk l completes by running
+        # the CM over [c_0, ĉ_1, ..., ĉ_{l-1}] — a forward over just the first l
+        # chunks, which keeps CM-input length == complete-chunk count. 'pooled'
+        # teacher-forces encoder-pooled concepts instead.
+        k = self.config.concept_chunk
+        use_pred = concept_feedback == 'predicted' and self.config.arch == 'ncp'
+        hist = None                                                              # (B, m, d): [c_0, ĉ_1, ..., ĉ_{m-1}]
         finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
         for _ in range(max_new_tokens):
-            logits = self.forward(input_ids)['logits'][:, -1, :] / temperature
+            if use_pred:
+                m = input_ids.shape[1] // k
+                while m > 0 and (hist is None or hist.shape[1] < m):
+                    l = 0 if hist is None else hist.shape[1]
+                    res = self.forward(input_ids[:, :max(l, 1) * k], concept_history=hist)
+                    nxt = res['concepts'][:, :1] if hist is None else res['chat'][:, -1:]
+                    hist = nxt if hist is None else torch.cat([hist, nxt], dim=1)
+                res = self.forward(input_ids, concept_history=hist if m > 0 else None)
+            else:
+                res = self.forward(input_ids)
+            logits = res['logits'][:, -1, :] / temperature
             if repetition_penalty != 1.0:
                 for i in range(input_ids.shape[0]):
                     seen = torch.unique(input_ids[i]); score = logits[i, seen]

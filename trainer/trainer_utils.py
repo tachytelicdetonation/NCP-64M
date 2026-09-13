@@ -91,8 +91,9 @@ def build_optimizers(model, args):
                 torch.optim.AdamW(adam_params, lr=args.learning_rate, betas=(0.9, 0.95), weight_decay=args.weight_decay)]
         Logger(f'Optimizer: Muon ({sum(p.numel() for p in muon_params) / 1e6:.2f}M params) + AdamW ({sum(p.numel() for p in adam_params) / 1e6:.2f}M params)')
     else:
-        opts = [torch.optim.AdamW(model.parameters(), lr=args.learning_rate, betas=(0.9, 0.95), weight_decay=args.weight_decay)]
-        Logger('Optimizer: AdamW')
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        opts = [torch.optim.AdamW(trainable, lr=args.learning_rate, betas=(0.9, 0.95), weight_decay=args.weight_decay)]
+        Logger(f'Optimizer: AdamW ({sum(p.numel() for p in trainable) / 1e6:.2f}M params)')
     return opts
 
 def lm_checkpoint(lm_config, weight='pretrain', model=None, optimizers=None, epoch=0, step=0, save_dir='../checkpoints', **kwargs):

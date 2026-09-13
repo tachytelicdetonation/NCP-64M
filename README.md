@@ -104,11 +104,24 @@ uv run python trainer/train_pretrain.py --arch vanilla --use_irc 0 --save_weight
 `--optimizer muon` applies the paper's recipe: Muon for matrix parameters,
 AdamW for embeddings/heads/codebook.
 
+**VQ-only domain adaptation** (Sec. 5.1 — freeze the backbone, train only the
+VQ codebooks + prediction heads):
+
+```bash
+uv run python trainer/train_pretrain.py --from_weight pretrain --train_vq_only 1 \
+    --data_path dataset/<new_domain>.bin --save_weight vq_adapt
+```
+
+**Inference concept feedback** (Sec. 2.3): `eval_llm.py` defaults to
+`--concept_feedback predicted`, feeding the Concept Module's own predictions
+back autoregressively as the paper specifies. `--concept_feedback pooled`
+teacher-forces encoder-pooled concepts instead.
+
 ## Verification evidence
 
 | Check | Result |
 |---|---|
-| Unit tests | 9/9 pass — forward shapes, joint-loss identity, **strict no-future-leakage** through the concept path, VQ→codebook-only grads, NCP→CM+encoder grads |
+| Unit tests | 12/12 pass — forward shapes, joint-loss identity, **strict no-future-leakage** through the concept path, VQ→codebook-only grads, NCP→CM+encoder grads, concept-history override wiring, predicted-feedback generation, VQ-only freeze coverage |
 | Concept-channel isolation | with `sliding_window=4`, a perturbation in chunk 0 changes distant logits only via the concept pathway |
 | Short pretraining run | TinyStories 30k docs / 9.5M tokens on Apple MPS, AdamW: `ntp 6.33 → 4.31` over 150 steps, `ncp`/`vq` bounded and decreasing |
 | Generation | `eval_llm.py` produces continuations end-to-end (early-checkpoint gibberish, as expected) |
@@ -122,9 +135,10 @@ AdamW for embeddings/heads/codebook.
 - **Aux losses use elementwise-mean MSE** — the paper's segment-L2/S convention
   differs by a constant `seg_dim` factor, absorbed into α/β.
 - **α, β are undisclosed** — both default to 1.0 and are CLI flags.
-- **Inference feeds pooled concepts** of completed generated chunks rather than
-  predicted `ĉ` back autoregressively — strictly causal; the paper's variant is
-  a one-line change in `generate`.
+- **Autoregressive concept feedback is sequential**: `generate` rebuilds the
+  predicted-concept history one chunk at a time (paper-accurate), so crossing a
+  chunk boundary costs one extra forward. No KV cache — simple and correct at
+  this scale.
 - Per-head QK-norm (used by MiniMind) replaces OLMo-3's layer-wise QK-norm —
   this is the variant the paper itself found *more* stable under Muon (§4.6).
 
@@ -132,8 +146,8 @@ AdamW for embeddings/heads/codebook.
 
 - [ ] Controlled NCP-vs-vanilla convergence comparison at 64M (the paper's
       headline 1.95× speedup claim)
-- [ ] VQ-only domain adaptation — freeze the backbone, train only codebooks +
-      prediction heads (§5.1)
+- [x] VQ-only domain adaptation — freeze the backbone, train only codebooks +
+      prediction heads (§5.1) — `--train_vq_only 1`
 - [ ] Concept injection into a block-parallel speculative drafter (§5.3)
 - [ ] KV-cache generation (currently full-forward per step — simple and correct
       at this scale)
