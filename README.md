@@ -105,6 +105,33 @@ The default `--optimizer muon` applies the paper's recipe (Moonlight): Muon for
 matrix parameters, AdamW for embeddings/heads/codebook. Pass `--optimizer adamw`
 for a pure AdamW baseline.
 
+## Performance (RTX 3090)
+
+Measured end-to-end with wandb on a single 3090 (TinyStories, seq 512):
+
+| Config | tokens/s |
+|---|---|
+| eager, B=8×accum4 (original defaults) | ~44k |
+| `torch.compile` + B=96 | ~121k |
+| + max-autotune + batched/compiled Muon NS5 | ~124k |
+
+**~2.7× faster than the eager baseline** — on by default on CUDA:
+
+- `torch.compile` (default mode; `--compile_mode max-autotune` for long runs)
+  fuses the routing/norm/RoPE elementwise chains and picks flash-attention
+  kernels. Inductor cudagraphs are disabled — their pinned pools starve the
+  monitor's eval/diagnostic probes.
+- Muon groups params by shape: momentum updates run as `foreach` ops and
+  Newton-Schulz orthogonalization as one batched bmm chain per shape, itself
+  compiled — ~2000 kernel launches/step → a few dozen (68ms → ~30ms).
+- TF32 matmul enabled; `pin_memory` + `persistent_workers` on CUDA;
+  `expandable_segments` allocator. The VQ codebook argmin drops the
+  `‖c‖²` term (constant across codewords) and uses flat indexing instead of a
+  5-D gather.
+- Batch: B=96×512 fills ~17GB under compile; `--accumulation_steps` for larger
+  effective batches. Notes: eager IRC/CRC routing loops are *kept* — inductor
+  fuses them better than a hand-rolled stack+einsum (measured regression).
+
 ## Monitoring (wandb)
 
 ```bash

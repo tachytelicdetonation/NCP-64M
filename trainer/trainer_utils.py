@@ -54,30 +54,54 @@ def zeropower_via_newtonschulz5(G, steps=5):
 class Muon(torch.optim.Optimizer):
     """Muon (Moonlight flavor): orthogonalized momentum update for 2D matrix params.
     W <- W - lr * (muon_scale * sqrt(max(d_in, d_out)) * O + weight_decay * W)
-    matching Eq. 25 of the paper."""
+    matching Eq. 25 of the paper.
+
+    Params are grouped by shape: momentum updates run as foreach ops and
+    Newton-Schulz as batched bmms over stacked grads — a handful of kernel
+    launches per distinct shape instead of ~30 per matrix."""
     def __init__(self, params, lr=6e-5, momentum=0.95, nesterov=True, ns_steps=5,
                  muon_scale=0.2, weight_decay=0.0):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps,
                         muon_scale=muon_scale, weight_decay=weight_decay)
         super().__init__(params, defaults)
+        self._shape_groups = None
+        self._ns = zeropower_via_newtonschulz5
 
     @torch.no_grad()
     def step(self, closure=None):
         for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is None:
+            if self._shape_groups is None:
+                shapes = {}
+                for p in group['params']:
+                    shapes.setdefault(tuple(p.shape), []).append(p)
+                self._shape_groups = list(shapes.values())
+            for plist in self._shape_groups:
+                plist = [p for p in plist if p.grad is not None]
+                if not plist:
                     continue
-                g = p.grad
-                state = self.state[p]
-                if 'momentum_buffer' not in state:
-                    state['momentum_buffer'] = torch.zeros_like(g)
-                buf = state['momentum_buffer']
-                buf.lerp_(g, 1 - group['momentum'])
-                g = g.lerp_(buf, group['momentum']) if group['nesterov'] else buf
-                u = zeropower_via_newtonschulz5(g, group['ns_steps'])
-                scale = group['muon_scale'] * math.sqrt(max(p.size(0), p.size(1)))
-                p.mul_(1 - group['lr'] * group['weight_decay'])
-                p.add_(u.type_as(p), alpha=-group['lr'] * scale)
+                if plist[0].is_cuda and self._ns is zeropower_via_newtonschulz5:
+                    self._ns = torch.compile(zeropower_via_newtonschulz5)
+                bufs = []
+                for p in plist:
+                    state = self.state[p]
+                    if 'momentum_buffer' not in state:
+                        state['momentum_buffer'] = torch.zeros_like(p.grad)
+                    bufs.append(state['momentum_buffer'])
+                grads = [p.grad for p in plist]
+                torch._foreach_lerp_(bufs, grads, 1 - group['momentum'])
+                if group['nesterov']:
+                    torch._foreach_lerp_(grads, bufs, group['momentum'])
+                    src = grads
+                else:
+                    src = bufs
+                try:
+                    u = self._ns(torch.stack(src), group['ns_steps'])
+                except Exception:
+                    self._ns = zeropower_via_newtonschulz5
+                    u = self._ns(torch.stack(src), group['ns_steps'])
+                scale = group['muon_scale'] * math.sqrt(max(plist[0].size(0), plist[0].size(1)))
+                torch._foreach_mul_(plist, 1 - group['lr'] * group['weight_decay'])
+                torch._foreach_add_(plist, list(u.float().unbind(0)), alpha=-group['lr'] * scale)
 
 def build_optimizers(model, args):
     """Paper recipe: Muon for matrix-valued params, AdamW for embeddings/other."""

@@ -44,7 +44,7 @@ def train_epoch(epoch, loader, iters, optimizers, scaler, autocast_ctx, start_st
                 if scaler is not None: scaler.unscale_(opt)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             if monitor is not None:
-                monitor.on_boundary(model, grad_norm.item())
+                monitor.on_boundary(raw_model, grad_norm.item())
             for opt in optimizers:
                 if scaler is not None:
                     scaler.step(opt)
@@ -70,14 +70,14 @@ def train_epoch(epoch, loader, iters, optimizers, scaler, autocast_ctx, start_st
                 monitor.log_scalars(res, current_lr)
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
-            model.eval()
+            raw_model.eval()
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}.pth'
-            state_dict = {k: v.half().cpu() for k, v in model.state_dict().items()}
+            state_dict = {k: v.half().cpu() for k, v in raw_model.state_dict().items()}
             torch.save(state_dict, ckp)
-            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizers=optimizers,
+            lm_checkpoint(lm_config, weight=args.save_weight, model=raw_model, optimizers=optimizers,
                           epoch=epoch, step=step, save_dir=args.ckpt_dir,
                           wandb_run_id=monitor.run.id if monitor is not None else None)
-            model.train()
+            raw_model.train()
             del state_dict
 
         last_ids, last_labels = input_ids, labels   # tail-accumulation flush uses these
@@ -91,7 +91,7 @@ def train_epoch(epoch, loader, iters, optimizers, scaler, autocast_ctx, start_st
             if scaler is not None: scaler.unscale_(opt)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         if monitor is not None:
-            monitor.on_boundary(model, grad_norm.item())
+            monitor.on_boundary(raw_model, grad_norm.item())
         for opt in optimizers:
             (scaler.step(opt) if scaler is not None else opt.step())
         if scaler is not None: scaler.update()
@@ -162,6 +162,11 @@ if __name__ == "__main__":
     parser.add_argument('--gen_prompts', default=4, type=int)
     parser.add_argument('--peak_flops', default=0.0, type=float,
                         help="device peak FLOPS for MFU logging (0 = skip)")
+    parser.add_argument('--compile', default=1, type=int, choices=[0, 1],
+                        help="torch.compile the model on CUDA")
+    parser.add_argument('--compile_mode', default='default', type=str,
+                        choices=['default', 'max-autotune', 'max-autotune-no-cudagraphs',
+                                 'reduce-overhead'])
     args = parser.parse_args()
 
     # ========== 1. seed ==========
@@ -187,9 +192,27 @@ if __name__ == "__main__":
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     autocast_ctx = torch.autocast(device_type=device_type, dtype=dtype) if device_type in ("cuda", "mps") else nullcontext()
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16')) if device_type == "cuda" else None
+    if device_type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+        except Exception:
+            pass
 
     # ========== 4. model, data, optimizers ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device, save_dir=args.save_dir)
+    raw_model = model
+    if args.compile and device_type == "cuda":
+        try:
+            import torch._inductor.config as _inductor_cfg
+            _inductor_cfg.triton.cudagraphs = False  # pools pin VRAM and starve diag/eval probes
+        except Exception:
+            pass
+        model = torch.compile(model, mode=args.compile_mode)
+        Logger(f'torch.compile enabled (mode={args.compile_mode})')
+    # compiled graphs don't fire module forward hooks; monitor + checkpoints use
+    # raw_model (same parameter objects, so optimizer/grad views are unaffected)
     if args.train_vq_only:
         assert args.arch == 'ncp', '--train_vq_only requires --arch ncp'
         for name, p in model.named_parameters():
@@ -206,13 +229,14 @@ if __name__ == "__main__":
         else:
             Logger(f'Skipping val holdout: dataset too small ({train_ds.n_samples} windows)')
     loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                        num_workers=args.num_workers, pin_memory=False, drop_last=True)
+                        num_workers=args.num_workers, pin_memory=(device_type == "cuda"),
+                        persistent_workers=(args.num_workers > 0), drop_last=True)
     optimizers = build_optimizers(model, args)
 
     # ========== 5. resume ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
-        model.load_state_dict(ckp_data['model'])
+        raw_model.load_state_dict(ckp_data['model'])
         if ckp_data.get('optimizers'):
             for opt, sd in zip(optimizers, ckp_data['optimizers']):
                 opt.load_state_dict(sd)
@@ -223,7 +247,7 @@ if __name__ == "__main__":
     monitor = None
     if args.use_wandb and is_main_process():
         monitor = WandbMonitor(
-            model, tokenizer, optimizers, args, lm_config, autocast_ctx, scaler,
+            raw_model, tokenizer, optimizers, args, lm_config, autocast_ctx, scaler,
             val_ds=train_ds.dataset if isinstance(train_ds, Subset) else train_ds,
             eval_idx=eval_idx,
             run_id=ckp_data.get('wandb_run_id') if ckp_data else None)

@@ -259,15 +259,13 @@ class ProductQuantizer(nn.Module):
         """c: (B, M, d) continuous concepts -> d: (B, M, d) quantized, idx: (B, M, S)"""
         B, M, d = c.shape
         seg = c.view(B, M, self.S, self.seg_dim)                                   # (B, M, S, seg)
-        # squared L2 distance to every codeword: ||c||^2 - 2 c·e + ||e||^2
-        dist = seg.pow(2).sum(-1, keepdim=True) \
-               - 2 * torch.einsum('bmsk,snk->bmsn', seg, self.codebook) \
-               + self.codebook.pow(2).sum(-1).view(1, 1, self.S, self.N)            # (B, M, S, N)
-        idx = dist.argmin(-1)                                                      # (B, M, S)
-        dq = torch.gather(
-            self.codebook.unsqueeze(0).unsqueeze(0).expand(B, M, -1, -1, -1), 3,
-            idx.unsqueeze(-1).unsqueeze(-1).expand(B, M, self.S, 1, self.seg_dim)
-        ).squeeze(3)                                                               # (B, M, S, seg)
+        # argmin_e ||c - e||^2  ==  argmax_e (c·e - ||e||^2 / 2); the ||c||^2 term
+        # is constant across codewords so it drops out of the argmin entirely.
+        score = torch.einsum('bmsk,snk->bmsn', seg, self.codebook) \
+                - 0.5 * self.codebook.pow(2).sum(-1).view(1, 1, self.S, self.N)     # (B, M, S, N)
+        idx = score.argmax(-1)                                                     # (B, M, S)
+        flat = self.codebook.reshape(self.S * self.N, self.seg_dim)
+        dq = flat[idx + torch.arange(self.S, device=c.device) * self.N]            # (B, M, S, seg)
         return dq.reshape(B, M, d), idx
 
     def predict(self, u):
