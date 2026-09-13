@@ -58,6 +58,7 @@ def scalar_metrics(res, lr):
     m = {
         'loss/total': res['loss'].item(),
         'loss/ntp': res['loss_ntp'].item(),
+        'loss/ppl': math.exp(min(res['loss_ntp'].item(), 20.0)),
         'opt/lr': lr,
         'model/logit_absmax': res['logits'].detach().abs().max().item(),
         'model/hidden_rms': res['hidden_states'].detach().float().pow(2).mean().sqrt().item(),
@@ -363,6 +364,7 @@ def eval_split(model, ds, eval_idx, batch_size, device, autocast_ctx, max_batche
     finally:
         model.train(was_training)
     out = {f'val/{k}': v / max(n, 1) for k, v in agg.items()}
+    out['val/ppl'] = math.exp(min(out.get('val/ntp', 20.0), 20.0))
     return out
 
 
