@@ -1,0 +1,12 @@
+[project]
+name = "ncp-llm"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets>=5.0.1",
+    "numpy>=2.4.6",
+    "pytest>=9.1.1",
+    "tokenizers>=0.23.2",
+    "torch>=2.14.0",
+    "transformers>=5.17.0",
+]
