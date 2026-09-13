@@ -156,6 +156,8 @@ if __name__ == "__main__":
                         help="optimizer steps between val-split evals")
     parser.add_argument('--eval_batches', default=16, type=int,
                         help="batches in the held-out val slice (0 disables the holdout)")
+    parser.add_argument('--eval_bins', nargs='*', default=[],
+                        help='extra val bins as name=path (per-source / OOD); logged as val_<name>/*')
     parser.add_argument('--showcase_interval', default=1000, type=int,
                         help="optimizer steps between showcase tables/images (generations, codebook, routing)")
     parser.add_argument('--gen_tokens', default=64, type=int)
@@ -246,10 +248,16 @@ if __name__ == "__main__":
     # ========== 6. wandb monitor ==========
     monitor = None
     if args.use_wandb and is_main_process():
+        extra_evals = {}
+        for spec in args.eval_bins:
+            name, path = spec.split('=', 1)
+            eds = PretrainDataset(path, seq_len=args.max_seq_len)
+            extra_evals[name] = (eds, list(range(eds.n_samples)))
+            Logger(f'eval bin {name}: {eds.n_samples} windows ({path})')
         monitor = WandbMonitor(
             raw_model, tokenizer, optimizers, args, lm_config, autocast_ctx, scaler,
             val_ds=train_ds.dataset if isinstance(train_ds, Subset) else train_ds,
-            eval_idx=eval_idx,
+            eval_idx=eval_idx, extra_evals=extra_evals,
             run_id=ckp_data.get('wandb_run_id') if ckp_data else None)
 
     # ========== 7. train ==========

@@ -67,10 +67,10 @@ Mechanisms implemented faithfully to the paper's equations:
 ```bash
 uv sync          # or: pip install -r requirements.txt
 
-# 1) Data -> packed uint16 token stream (any jsonl {"text": ...} or a HF dataset)
+# 1) Data -> packed uint16 token stream (weighted multi-source mixer)
 uv run python scripts/prepare_data.py \
-    --hf_dataset roneneldan/TinyStories --hf_split train \
-    --text_field text --max_docs 30000 --out dataset/pretrain.bin
+    --source "stories=1.0:hf:roneneldan/TinyStories:train:text" \
+    --target_tokens 50000000 --out dataset/pretrain.bin
 
 # 2) Train the NCP model
 uv run python trainer/train_pretrain.py --data_path dataset/pretrain.bin --device mps
@@ -84,7 +84,45 @@ uv run pytest tests/
 
 minimind's own corpus also works: download `pretrain_hq.jsonl` from
 [huggingface.co/datasets/jingyaogong/minimind_dataset](https://huggingface.co/datasets/jingyaogong/minimind_dataset)
-and pass `--data_path <file>` to `prepare_data.py`.
+and pass `--source "minimind=1.0:file:pretrain_hq.jsonl:text"`.
+
+## Pretraining data (1.6B tokens)
+
+`prepare_data.py` interleaves weighted HF/jsonl sources with deficit-based
+scheduling (token-accurate shares), tokenizes in parallel via the lightweight
+`tokenizers` backend, and emits per-source + out-of-distribution val bins:
+
+```bash
+uv run python scripts/prepare_data.py \
+    --source "finepdfs=0.45:hf:codelion/finepdfs-1B:train:text" \
+    --source "dclm=0.27:hf:codelion/dclm-baseline-1B:train:text" \
+    --source "fineweb_edu=0.18:hf:codelion/fineweb-edu-1B:train:text" \
+    --source "sutra=0.10:hf:codelion/sutra-improved-100M:train:text" \
+    --ood "finewiki:hf:HuggingFaceFW/finewiki@en:train:text" \
+    --target_tokens 1600000000 \
+    --out dataset/pretrain_1p6b.bin --val_dir dataset/val
+```
+
+The mix follows the 70M-scale recipe from [codelion's dataset-mixing
+study](https://huggingface.co/blog/codelion/optimal-dataset-mixing)
+(finePDFs/DCLM/FineWeb-Edu ≈ 50/30/20) with 10% Sutra pedagogical data spliced
+in. `dataset/val/*.bin` holds per-source holdouts plus a FineWiki OOD slice —
+point `--eval_bins` at them for `val_<source>/*` metrics in wandb:
+
+```bash
+uv run python trainer/train_pretrain.py --data_path dataset/pretrain_1p6b.bin \
+    --eval_bins finepdfs=dataset/val/finepdfs.bin dclm=dataset/val/dclm.bin \
+                fineweb_edu=dataset/val/fineweb_edu.bin sutra=dataset/val/sutra.bin \
+                ood_finewiki=dataset/val/ood_finewiki.bin ...
+```
+
+Zero-shot benchmark eval (BoolQ/PIQA/ARC-E/OBQA/WinoGrande/HellaSwag,
+likelihood-scored, works on NCP checkpoints and any HF causal LM):
+
+```bash
+uv run python scripts/eval_zeroshot.py --ckpt out/pretrain_768.pth
+uv run python scripts/eval_zeroshot.py --hf_model <minimind3-checkpoint>   # comparison
+```
 
 ### Ablations (Sec. 4.3.2 of the paper)
 
@@ -153,9 +191,9 @@ What gets logged (see `trainer/metrics.py`):
 
 | Group | Metrics |
 |---|---|
-| `loss/`, `val/` | total / NTP / NCP / VQ, train and held-out split |
+| `loss/`, `val/` | total / NTP / NCP / VQ (train and held-out split), token ppl `exp(ntp)`, token accuracy, train↔val `gap_ntp`; `val_<src>/*` per-source and OOD bins via `--eval_bins`; `best_*` run summaries |
 | `opt/`, `grad/` | lr, global grad-norm (pre-clip), clip-event rate, weight norm, per-module grad norms |
-| `perf/` | tokens/sec, tokens seen (use as x-axis for ablations), est. TFLOPs, MFU with `--peak_flops` |
+| `perf/` | tokens/sec, tokens seen (use as x-axis for ablations), est. TFLOPs, MFU with `--peak_flops`, peak GPU memory |
 | `vq/` | per-segment codebook perplexity `exp(H)`, active-code fraction, dead-code count |
 | `ncp/` | **concept top-1 accuracy** (`argmax π` vs next chunk's true code, per segment), prediction confidence + normalized entropy |
 | `routing/` | IRC off-residual mass & last-state weight per module; CRC alpha entropy/last-depth per consumer←source; `crc_scale` injection strength; `concept_gain` |

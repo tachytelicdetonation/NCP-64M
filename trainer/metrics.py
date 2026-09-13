@@ -345,11 +345,12 @@ def attn_metrics(attns):
 
 
 @torch.no_grad()
-def eval_split(model, ds, eval_idx, batch_size, device, autocast_ctx, max_batches):
-    """Val metrics on a fixed slice (indices excluded from the train loader)."""
+def eval_split(model, ds, eval_idx, batch_size, device, autocast_ctx, max_batches,
+               prefix='val/'):
+    """Token-weighted val metrics on a fixed index slice."""
     was_training = model.training
     model.eval()
-    agg, n = defaultdict(float), 0
+    agg, ntok = defaultdict(float), 0
     try:
         for b in range(min(max_batches, len(eval_idx) // batch_size)):
             idxs = eval_idx[b * batch_size:(b + 1) * batch_size]
@@ -357,18 +358,19 @@ def eval_split(model, ds, eval_idx, batch_size, device, autocast_ctx, max_batche
             y = torch.stack([ds[i][1] for i in idxs]).to(device)
             with autocast_ctx:
                 res = model(x, labels=y)
-            agg['loss'] += res['loss'].item()
-            agg['ntp'] += res['loss_ntp'].item()
             mask = y != -100
-            agg['acc'] += (res['logits'].argmax(-1)[mask] == y[mask]).float().mean().item()
+            n = int(mask.sum())
+            ntok += n
+            agg['loss'] += res['loss'].item() * n
+            agg['ntp'] += res['loss_ntp'].item() * n
+            agg['acc'] += (res['logits'].argmax(-1)[mask] == y[mask]).float().sum().item()
             if res.get('loss_ncp') is not None:
-                agg['ncp'] += res['loss_ncp'].item()
-                agg['vq'] += res['loss_vq'].item()
-            n += 1
+                agg['ncp'] += res['loss_ncp'].item() * n
+                agg['vq'] += res['loss_vq'].item() * n
     finally:
         model.train(was_training)
-    out = {f'val/{k}': v / max(n, 1) for k, v in agg.items()}
-    out['val/ppl'] = math.exp(min(out.get('val/ntp', 20.0), 20.0))
+    out = {f'{prefix}{k}': v / max(ntok, 1) for k, v in agg.items()}
+    out[f'{prefix}ppl'] = math.exp(min(out.get(f'{prefix}ntp', 20.0), 20.0))
     return out
 
 
@@ -380,7 +382,7 @@ class WandbMonitor:
     GEN_PROMPTS = ['Once upon a time', 'The little girl', 'One day, a cat', 'In a small village']
 
     def __init__(self, model, tokenizer, optimizers, args, lm_config, autocast_ctx, scaler,
-                 val_ds=None, eval_idx=None, run_id=None):
+                 val_ds=None, eval_idx=None, extra_evals=None, run_id=None):
         import wandb
         self.wandb = wandb
         self.args = args
@@ -392,6 +394,8 @@ class WandbMonitor:
         self.scaler = scaler
         self.val_ds = val_ds
         self.eval_idx = eval_idx or []
+        self.extra_evals = extra_evals or {}   # name -> (ds, eval_idx)
+        self._last_ntp = None
         self.opt_step = 0          # optimizer steps (cadence + alerts)
         self.micro_step = 0        # global micro-step = wandb x-axis
         self.tokens_seen = 0
@@ -439,6 +443,7 @@ class WandbMonitor:
 
     def log_scalars(self, res, lr):
         m = scalar_metrics(res, lr)
+        self._last_ntp = m.get('loss/ntp')
         m['opt/grad_norm'] = self.grad_hist[-1] if self.grad_hist else 0.0
         m['opt/clip_rate'] = self._clip_events / max(self._clip_total, 1)
         m.update(self.grad_groups)
@@ -470,6 +475,12 @@ class WandbMonitor:
             vm = eval_split(self.model, self.val_ds, self.eval_idx,
                             min(a.batch_size, 32),  # probes run eager — cap the activation spike
                             self.device, self.autocast_ctx, a.eval_batches)
+            if self._last_ntp is not None:
+                vm['val/gap_ntp'] = vm['val/ntp'] - self._last_ntp
+            for name, (ds, idx) in self.extra_evals.items():
+                vm.update(eval_split(self.model, ds, idx, min(a.batch_size, 32),
+                                     self.device, self.autocast_ctx,
+                                     min(a.eval_batches, 8), prefix=f'val_{name}/'))
             self.run.log(vm, step=self.micro_step)
             for k, v in vm.items():
                 best = f'best_{k}'
