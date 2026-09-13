@@ -22,7 +22,7 @@ def train_epoch(epoch, loader, iters, optimizers, scaler, autocast_ctx, start_st
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
         last_step = step
-        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
+        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate, args.warmup_ratio)
         for opt in optimizers:
             for param_group in opt.param_groups:
                 param_group['lr'] = lr
@@ -111,7 +111,9 @@ if __name__ == "__main__":
     parser.add_argument("--max_steps", type=int, default=0, help=">0 caps total optimizer-visible steps per epoch")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=5e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--weight_decay", type=float, default=0.1)
+    parser.add_argument("--warmup_ratio", type=float, default=0.02,
+                        help="fraction of total steps spent in linear lr warmup")
     parser.add_argument("--optimizer", type=str, default="muon", choices=["adamw", "muon"])
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     parser.add_argument("--dtype", type=str, default="bfloat16")

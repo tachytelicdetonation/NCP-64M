@@ -24,8 +24,12 @@ def Logger(content):
     if is_main_process():
         print(content)
 
-def get_lr(current_step, total_steps, lr):
-    return lr * (0.1 + 0.45 * (1 + math.cos(math.pi * current_step / total_steps)))
+def get_lr(current_step, total_steps, lr, warmup_ratio=0.02):
+    warmup = max(1, int(total_steps * warmup_ratio))
+    if current_step < warmup:
+        return lr * (current_step + 1) / warmup
+    progress = (current_step - warmup) / max(1, total_steps - warmup)
+    return lr * (0.1 + 0.45 * (1 + math.cos(math.pi * progress)))
 
 def setup_seed(seed: int):
     random.seed(seed)
