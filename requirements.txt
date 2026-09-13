@@ -4,3 +4,5 @@ datasets>=3.0
 tokenizers>=0.20
 numpy>=1.26
 pytest>=8.0
+wandb>=0.19
+pillow>=10.0

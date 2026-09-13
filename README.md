@@ -104,6 +104,38 @@ uv run python trainer/train_pretrain.py --arch vanilla --use_irc 0 --save_weight
 `--optimizer muon` applies the paper's recipe: Muon for matrix parameters,
 AdamW for embeddings/heads/codebook.
 
+## Monitoring (wandb)
+
+```bash
+uv run python trainer/train_pretrain.py --use_wandb 1 --wandb_project ncp \
+    --data_path dataset/pretrain.bin --device mps
+```
+
+`--wandb_mode offline` logs locally without an account; `--from_resume 1`
+continues the same run (the run id is stored in the resume checkpoint). Three
+cadences, all in optimizer steps: `--log_interval` scalars,
+`--diag_interval` (250) diagnostics, `--eval_interval` (500) val split,
+`--showcase_interval` (1000) tables/images. `--eval_batches 16` carves a fixed
+holdout off the tail of the token stream (0 disables it).
+
+What gets logged (see `trainer/metrics.py`):
+
+| Group | Metrics |
+|---|---|
+| `loss/`, `val/` | total / NTP / NCP / VQ, train and held-out split |
+| `opt/`, `grad/` | lr, global grad-norm (pre-clip), clip-event rate, weight norm, per-module grad norms |
+| `perf/` | tokens/sec, tokens seen (use as x-axis for ablations), est. TFLOPs, MFU with `--peak_flops` |
+| `vq/` | per-segment codebook perplexity `exp(H)`, active-code fraction, dead-code count |
+| `ncp/` | **concept top-1 accuracy** (`argmax π` vs next chunk's true code, per segment), prediction confidence + normalized entropy |
+| `routing/` | IRC off-residual mass & last-state weight per module; CRC alpha entropy/last-depth per consumer←source; `crc_scale` injection strength; `concept_gain` |
+| `update/` | `‖ΔW‖/‖W‖` per param group, update-RMS/lr (Muon & AdamW ≈0.2 target), spectral entropy of ΔW (early collapse signal) |
+| `attn/`, `act/` | per-layer attention entropy + max logit (probe forward, flash off), per-block residual RMS |
+| `gns/` | gradient noise scale ≈ critical batch size (two-half-batch estimator) |
+| `show/` | generation samples table, codebook table (open with wandb's Embedding Projector), IRC/CRC routing heatmap tables, per-chunk-position accuracy, attention-map images |
+| watch | `wandb.watch` per-layer gradient/parameter histograms (`--wandb_watch`, `--watch_freq`) |
+
+Grad-norm spikes (>3× running median) and NaN loss/grad fire `wandb.alert`.
+
 **VQ-only domain adaptation** (Sec. 5.1 — freeze the backbone, train only the
 VQ codebooks + prediction heads):
 
@@ -121,7 +153,7 @@ teacher-forces encoder-pooled concepts instead.
 
 | Check | Result |
 |---|---|
-| Unit tests | 12/12 pass — forward shapes, joint-loss identity, **strict no-future-leakage** through the concept path, VQ→codebook-only grads, NCP→CM+encoder grads, concept-history override wiring, predicted-feedback generation, VQ-only freeze coverage |
+| Unit tests | 25/25 pass — forward shapes, joint-loss identity, **strict no-future-leakage** through the concept path, VQ→codebook-only grads, NCP→CM+encoder grads, concept-history override wiring, predicted-feedback generation, VQ-only freeze coverage, label-alignment pin, W&B metric helpers |
 | Concept-channel isolation | with `sliding_window=4`, a perturbation in chunk 0 changes distant logits only via the concept pathway |
 | Short pretraining run | TinyStories 30k docs / 9.5M tokens on Apple MPS, AdamW: `ntp 6.73 → 3.89` over 150 steps, `ncp`/`vq` bounded and decreasing |
 | Generation | `eval_llm.py` produces continuations end-to-end (early-checkpoint gibberish, as expected) |
@@ -159,9 +191,10 @@ model/model_ncp.py          config + model: encoder/CM/decoder, PQ-VQ, IRC/CRC, 
 model/tokenizer*.json       bundled BPE tokenizer (vocab 6400, from MiniMind)
 dataset/lm_dataset.py       fixed-length windows over a packed token stream
 scripts/prepare_data.py     jsonl / HF dataset -> packed .bin
-trainer/train_pretrain.py   training loop (AdamW|Muon, per-loss logging, resume)
+trainer/train_pretrain.py   training loop (AdamW|Muon, per-loss logging, resume, wandb)
 trainer/train_tokenizer.py  train a fresh BPE tokenizer on your own corpus
 trainer/trainer_utils.py    Muon optimizer, lr schedule, checkpointing
+trainer/metrics.py          wandb catalog: VQ/concept stats, routing probes, dW spectra, GNS
 eval_llm.py                 sampling / generation
 tests/test_ncp.py           causality, gradient-flow, param-count checks
 ```

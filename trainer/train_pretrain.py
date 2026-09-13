@@ -8,13 +8,14 @@ import argparse
 import time
 import torch
 from contextlib import nullcontext
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from model.model_ncp import NCPConfig
 from dataset.lm_dataset import PretrainDataset
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, setup_seed, init_model, build_optimizers
+from trainer.metrics import WandbMonitor
 
 
-def train_epoch(epoch, loader, iters, optimizers, scaler, autocast_ctx, start_step=0):
+def train_epoch(epoch, loader, iters, optimizers, scaler, autocast_ctx, start_step=0, monitor=None):
     start_time = time.time()
     last_step = start_step
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
@@ -25,6 +26,9 @@ def train_epoch(epoch, loader, iters, optimizers, scaler, autocast_ctx, start_st
         for opt in optimizers:
             for param_group in opt.param_groups:
                 param_group['lr'] = lr
+
+        if monitor is not None:
+            monitor.note_micro(input_ids, epoch * iters + step)
 
         with autocast_ctx:
             res = model(input_ids, labels=labels)
@@ -38,7 +42,9 @@ def train_epoch(epoch, loader, iters, optimizers, scaler, autocast_ctx, start_st
         if step % args.accumulation_steps == 0:
             for opt in optimizers:
                 if scaler is not None: scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            if monitor is not None:
+                monitor.on_boundary(model, grad_norm.item())
             for opt in optimizers:
                 if scaler is not None:
                     scaler.step(opt)
@@ -47,6 +53,8 @@ def train_epoch(epoch, loader, iters, optimizers, scaler, autocast_ctx, start_st
             if scaler is not None: scaler.update()
             for opt in optimizers:
                 opt.zero_grad(set_to_none=True)
+            if monitor is not None:
+                monitor.on_opt_step(input_ids, labels, lr)
 
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
@@ -58,6 +66,8 @@ def train_epoch(epoch, loader, iters, optimizers, scaler, autocast_ctx, start_st
             if res['loss_ncp'] is not None:
                 msg += f', ncp: {res["loss_ncp"].item():.4f}, vq: {res["loss_vq"].item():.4f}'
             Logger(msg)
+            if monitor is not None:
+                monitor.log_scalars(res, current_lr)
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
@@ -65,10 +75,12 @@ def train_epoch(epoch, loader, iters, optimizers, scaler, autocast_ctx, start_st
             state_dict = {k: v.half().cpu() for k, v in model.state_dict().items()}
             torch.save(state_dict, ckp)
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizers=optimizers,
-                          epoch=epoch, step=step, save_dir=args.ckpt_dir)
+                          epoch=epoch, step=step, save_dir=args.ckpt_dir,
+                          wandb_run_id=monitor.run.id if monitor is not None else None)
             model.train()
             del state_dict
 
+        last_ids, last_labels = input_ids, labels   # tail-accumulation flush uses these
         del input_ids, labels, res, loss
 
         if args.max_steps > 0 and step >= args.max_steps:
@@ -77,12 +89,16 @@ def train_epoch(epoch, loader, iters, optimizers, scaler, autocast_ctx, start_st
     if last_step > start_step and last_step % args.accumulation_steps != 0:
         for opt in optimizers:
             if scaler is not None: scaler.unscale_(opt)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        if monitor is not None:
+            monitor.on_boundary(model, grad_norm.item())
         for opt in optimizers:
             (scaler.step(opt) if scaler is not None else opt.step())
         if scaler is not None: scaler.update()
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
+        if monitor is not None:
+            monitor.on_opt_step(last_ids, last_labels, optimizers[-1].param_groups[-1]['lr'])
     return last_step
 
 
@@ -124,6 +140,26 @@ if __name__ == "__main__":
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1])
     parser.add_argument('--train_vq_only', default=0, type=int, choices=[0, 1],
                         help="Sec. 5.1: freeze the backbone and train only VQ codebooks + concept-prediction heads (use with --from_weight)")
+    # wandb monitoring (see trainer/metrics.py for the metric catalog)
+    parser.add_argument('--use_wandb', default=0, type=int, choices=[0, 1])
+    parser.add_argument('--wandb_project', default='ncp-pretrain', type=str)
+    parser.add_argument('--wandb_run_name', default='', type=str)
+    parser.add_argument('--wandb_mode', default='online', choices=['online', 'offline', 'disabled'])
+    parser.add_argument('--wandb_watch', default=1, type=int, choices=[0, 1],
+                        help="wandb.watch per-layer grad/param histograms")
+    parser.add_argument('--watch_freq', default=500, type=int)
+    parser.add_argument('--diag_interval', default=250, type=int,
+                        help="optimizer steps between diagnostics (update ratios, attn entropy, GNS)")
+    parser.add_argument('--eval_interval', default=500, type=int,
+                        help="optimizer steps between val-split evals")
+    parser.add_argument('--eval_batches', default=16, type=int,
+                        help="batches in the held-out val slice (0 disables the holdout)")
+    parser.add_argument('--showcase_interval', default=1000, type=int,
+                        help="optimizer steps between showcase tables/images (generations, codebook, routing)")
+    parser.add_argument('--gen_tokens', default=64, type=int)
+    parser.add_argument('--gen_prompts', default=4, type=int)
+    parser.add_argument('--peak_flops', default=0.0, type=float,
+                        help="device peak FLOPS for MFU logging (0 = skip)")
     args = parser.parse_args()
 
     # ========== 1. seed ==========
@@ -159,6 +195,14 @@ if __name__ == "__main__":
         Logger(f'VQ-only adaptation: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M '
                'trainable (codebooks + prediction heads)')
     train_ds = PretrainDataset(args.data_path, seq_len=args.max_seq_len)
+    eval_idx = []
+    if args.use_wandb and args.eval_batches > 0:
+        eval_windows = args.eval_batches * args.batch_size
+        if train_ds.n_samples > eval_windows + args.batch_size:
+            eval_idx = list(range(train_ds.n_samples - eval_windows, train_ds.n_samples))
+            train_ds = Subset(train_ds, range(train_ds.n_samples - eval_windows))
+        else:
+            Logger(f'Skipping val holdout: dataset too small ({train_ds.n_samples} windows)')
     loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                         num_workers=args.num_workers, pin_memory=False, drop_last=True)
     optimizers = build_optimizers(model, args)
@@ -173,11 +217,29 @@ if __name__ == "__main__":
         start_epoch, start_step = ckp_data['epoch'], ckp_data.get('step', 0)
         Logger(f'Resumed from epoch {start_epoch} step {start_step}')
 
-    # ========== 6. train ==========
+    # ========== 6. wandb monitor ==========
+    monitor = None
+    if args.use_wandb and is_main_process():
+        monitor = WandbMonitor(
+            model, tokenizer, optimizers, args, lm_config, autocast_ctx, scaler,
+            val_ds=train_ds.dataset if isinstance(train_ds, Subset) else train_ds,
+            eval_idx=eval_idx,
+            run_id=ckp_data.get('wandb_run_id') if ckp_data else None)
+
+    # ========== 7. train ==========
     iters = len(loader)
-    for epoch in range(start_epoch, args.epochs):
-        last = train_epoch(epoch, loader, iters, optimizers, scaler, autocast_ctx,
-                           start_step if epoch == start_epoch else 0)
-        if args.max_steps > 0 and last >= args.max_steps:
-            break
-    Logger('Training done.')
+    if monitor is not None:
+        monitor.micro_step = start_epoch * iters + start_step
+        monitor.opt_step = monitor.micro_step // args.accumulation_steps
+        monitor.tokens_seen = monitor.opt_step * args.batch_size * args.max_seq_len * args.accumulation_steps
+        monitor.updates.mark(monitor.opt_step)
+    try:
+        for epoch in range(start_epoch, args.epochs):
+            last = train_epoch(epoch, loader, iters, optimizers, scaler, autocast_ctx,
+                               start_step if epoch == start_epoch else 0, monitor=monitor)
+            if args.max_steps > 0 and last >= args.max_steps:
+                break
+        Logger('Training done.')
+    finally:
+        if monitor is not None:
+            monitor.finish()

@@ -5,3 +5,4 @@ out/
 checkpoints/
 dataset/*.bin
 .DS_Store
+wandb/

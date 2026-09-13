@@ -96,7 +96,8 @@ def build_optimizers(model, args):
         Logger(f'Optimizer: AdamW ({sum(p.numel() for p in trainable) / 1e6:.2f}M params)')
     return opts
 
-def lm_checkpoint(lm_config, weight='pretrain', model=None, optimizers=None, epoch=0, step=0, save_dir='../checkpoints', **kwargs):
+def lm_checkpoint(lm_config, weight='pretrain', model=None, optimizers=None, epoch=0, step=0,
+                  save_dir='../checkpoints', wandb_run_id=None, **kwargs):
     os.makedirs(save_dir, exist_ok=True)
     suffix = f'_{weight}_{lm_config.hidden_size}'
     ckp_path = f'{save_dir}/{suffix}.pth'
@@ -105,7 +106,8 @@ def lm_checkpoint(lm_config, weight='pretrain', model=None, optimizers=None, epo
         state_dict = {k: v.half().cpu() for k, v in model.state_dict().items()}
         torch.save(state_dict, ckp_path + '.tmp'); os.replace(ckp_path + '.tmp', ckp_path)
         resume_data = {'model': state_dict, 'epoch': epoch, 'step': step,
-                       'optimizers': [o.state_dict() for o in optimizers] if optimizers else None}
+                       'optimizers': [o.state_dict() for o in optimizers] if optimizers else None,
+                       'wandb_run_id': wandb_run_id}
         torch.save(resume_data, resume_path + '.tmp'); os.replace(resume_path + '.tmp', resume_path)
     else:
         if os.path.exists(resume_path):

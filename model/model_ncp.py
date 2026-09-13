@@ -101,6 +101,9 @@ class Attention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
+        # when True (and on the non-flash path), stash attention probs + max logit
+        # for monitoring; used by trainer/metrics.py's diagnostic probe
+        self.capture_attn = False
 
     def forward(self, x, position_embeddings, attention_mask=None):
         bsz, seq_len, _ = x.shape
@@ -116,13 +119,19 @@ class Attention(nn.Module):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
         else:
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if self.capture_attn:
+                # pre-mask: the causal -inf would saturate a max-logit monitor
+                self.last_attn_max_logit = scores.detach().abs().max()
             mask = torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
             if self.sliding_window > 0:
                 band = torch.arange(seq_len, device=scores.device)
                 mask = mask.masked_fill((band[:, None] - band[None, :]) >= self.sliding_window, float("-inf"))
             scores += mask
             if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
-            output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
+            probs = F.softmax(scores.float(), dim=-1)
+            if self.capture_attn:
+                self.last_attn_probs = probs.detach()
+            output = self.attn_dropout(probs.type_as(xq)) @ xv
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
         return output
@@ -326,7 +335,7 @@ class NCPModel(nn.Module):
 
         if self.config.arch != "ncp":
             hidden, _ = self.vanilla(x, position_embeddings, attention_mask=attention_mask)
-            return self.norm(hidden), {}
+            return self.norm(hidden), {'code_idx': None, 'pi': None}
 
         # 1. Token Encoder (Eq. 1)
         h, xs_enc = self.token_encoder(x, position_embeddings, attention_mask=attention_mask)
@@ -335,7 +344,8 @@ class NCPModel(nn.Module):
         if m == 0:  # sequence shorter than one chunk: no concept signal yet
             h_dec, _ = self.token_decoder(h, position_embeddings, crc_inputs=None, attention_mask=attention_mask)
             z = h.new_zeros(())
-            return self.norm(h_dec), {'loss_ncp': z, 'loss_vq': z, 'chat': None, 'concepts': None}
+            return self.norm(h_dec), {'loss_ncp': z, 'loss_vq': z, 'chat': None, 'concepts': None,
+                                      'code_idx': None, 'pi': None}
 
         # 2. continuous concepts + VQ (Eq. 2-6); concepts are RMS-normalized to a
         # fixed scale before quantization, prediction, and feedback
@@ -367,7 +377,8 @@ class NCPModel(nn.Module):
                 'cm': [self.causal_repeat(s, T) for s in xs_cm[1:]],
             }
         h_dec, _ = self.token_decoder(h_tilde, position_embeddings, crc_inputs=dec_crc, attention_mask=attention_mask)
-        return self.norm(h_dec), {'loss_ncp': ncp_loss, 'loss_vq': vq_loss, 'chat': chat, 'concepts': c}
+        return self.norm(h_dec), {'loss_ncp': ncp_loss, 'loss_vq': vq_loss, 'chat': chat, 'concepts': c,
+                                  'code_idx': code_idx, 'pi': pi}
 
 class NCPForCausalLM(PreTrainedModel):
     config_class = NCPConfig
@@ -407,7 +418,8 @@ class NCPForCausalLM(PreTrainedModel):
             if 'loss_vq' in losses: loss = loss + self.config.vq_loss_weight * losses['loss_vq']
         return {'loss': loss, 'loss_ntp': loss_ntp, 'loss_ncp': losses.get('loss_ncp'),
                 'loss_vq': losses.get('loss_vq'), 'logits': logits, 'hidden_states': hidden_states,
-                'chat': losses.get('chat'), 'concepts': losses.get('concepts')}
+                'chat': losses.get('chat'), 'concepts': losses.get('concepts'),
+                'code_idx': losses.get('code_idx'), 'pi': losses.get('pi')}
 
     @torch.inference_mode()
     def generate(self, input_ids=None, max_new_tokens=512, temperature=0.85, top_p=0.85, top_k=50,
