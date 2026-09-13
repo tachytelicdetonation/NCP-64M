@@ -1,5 +1,6 @@
 import torch
 import pytest
+import torch.nn.functional as F
 from model.model_ncp import NCPConfig, NCPForCausalLM
 
 VOCAB, T, K = 6400, 64, 4
@@ -13,6 +14,22 @@ def ids(B=2):
     g = torch.Generator().manual_seed(0)
     return torch.randint(0, VOCAB, (B, T), generator=g)
 
+def xy(B=2):
+    """Dataset-convention (input, labels) pair: pre-shifted, buf[:-1]/buf[1:]."""
+    g = torch.Generator().manual_seed(0)
+    buf = torch.randint(0, VOCAB, (B, T + 1), generator=g)
+    return buf[:, :-1], buf[:, 1:]
+
+def test_ntp_scores_logits_against_preshifted_labels():
+    """Pre-shifted labels mean logits[t] is scored against labels[t] = the token
+    after input[t]. Regression pin: the model must NOT shift labels again."""
+    model = make_model()
+    x, y = xy()
+    out = model(x, labels=y)
+    expected = F.cross_entropy(out['logits'].reshape(-1, VOCAB), y.reshape(-1),
+                               ignore_index=-100)
+    assert torch.allclose(out['loss_ntp'], expected)
+
 def test_param_count_64m_class():
     model = make_model()
     total = sum(p.numel() for p in model.parameters()) / 1e6
@@ -21,8 +38,8 @@ def test_param_count_64m_class():
 
 def test_forward_shapes_and_losses():
     model = make_model()
-    x = ids()
-    out = model(x, labels=x)
+    x, y = xy()
+    out = model(x, labels=y)
     assert out['logits'].shape == (2, T, VOCAB)
     for key in ('loss', 'loss_ntp', 'loss_ncp', 'loss_vq'):
         assert torch.isfinite(out[key])
@@ -61,9 +78,9 @@ def test_concept_signal_reaches_decoder():
 
 def test_vq_loss_updates_codebook_only():
     model = make_model()
-    x = ids()
+    x, y = xy()
     model.zero_grad(set_to_none=True)
-    out = model(x, labels=x)
+    out = model(x, labels=y)
     out['loss_vq'].backward()
     assert model.model.quantizer.codebook.grad is not None and model.model.quantizer.codebook.grad.abs().sum() > 0
     enc_grads = [p.grad for n, p in model.named_parameters() if 'token_encoder' in n and p.grad is not None]
@@ -71,9 +88,9 @@ def test_vq_loss_updates_codebook_only():
 
 def test_ncp_loss_trains_encoder_and_concept_module():
     model = make_model()
-    x = ids()
+    x, y = xy()
     model.zero_grad(set_to_none=True)
-    out = model(x, labels=x)
+    out = model(x, labels=y)
     out['loss_ncp'].backward()
     for name in ('concept_module', 'token_encoder'):
         grads = [p.grad for n, p in model.named_parameters() if name in n and p.grad is not None]
@@ -84,8 +101,8 @@ def test_ncp_loss_trains_encoder_and_concept_module():
 def test_joint_backward_covers_all_paths():
     model = make_model()
     model.train()
-    x = ids()
-    out = model(x, labels=x)
+    x, y = xy()
+    out = model(x, labels=y)
     out['loss'].backward()
     missing = [n for n, p in model.named_parameters()
                if p.grad is None or p.grad.abs().sum() == 0]
@@ -100,8 +117,8 @@ def test_joint_backward_covers_all_paths():
 
 def test_vanilla_baseline():
     model = make_model(arch='vanilla', use_irc=False)
-    x = ids()
-    out = model(x, labels=x)
+    x, y = xy()
+    out = model(x, labels=y)
     assert out['loss_ncp'] is None and torch.isfinite(out['loss_ntp'])
     out['loss'].backward()
     total = sum(p.numel() for p in model.parameters()) / 1e6

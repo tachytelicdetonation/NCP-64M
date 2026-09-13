@@ -398,8 +398,10 @@ class NCPForCausalLM(PreTrainedModel):
         logits = self.lm_head(hidden_states)
         loss, loss_ntp = None, None
         if labels is not None:
-            x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
-            loss_ntp = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
+            # labels are pre-shifted targets (dataset emits buf[1:] for input
+            # buf[:-1]): logits[t] is scored against labels[t] directly.
+            loss_ntp = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
+                                       labels.reshape(-1), ignore_index=-100)
             loss = loss_ntp
             if 'loss_ncp' in losses: loss = loss + self.config.ncp_loss_weight * losses['loss_ncp']
             if 'loss_vq' in losses: loss = loss + self.config.vq_loss_weight * losses['loss_vq']

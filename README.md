@@ -123,7 +123,7 @@ teacher-forces encoder-pooled concepts instead.
 |---|---|
 | Unit tests | 12/12 pass — forward shapes, joint-loss identity, **strict no-future-leakage** through the concept path, VQ→codebook-only grads, NCP→CM+encoder grads, concept-history override wiring, predicted-feedback generation, VQ-only freeze coverage |
 | Concept-channel isolation | with `sliding_window=4`, a perturbation in chunk 0 changes distant logits only via the concept pathway |
-| Short pretraining run | TinyStories 30k docs / 9.5M tokens on Apple MPS, AdamW: `ntp 6.33 → 4.31` over 150 steps, `ncp`/`vq` bounded and decreasing |
+| Short pretraining run | TinyStories 30k docs / 9.5M tokens on Apple MPS, AdamW: `ntp 6.73 → 3.89` over 150 steps, `ncp`/`vq` bounded and decreasing |
 | Generation | `eval_llm.py` produces continuations end-to-end (early-checkpoint gibberish, as expected) |
 
 ## Deviations from the paper
