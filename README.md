@@ -1,13 +1,25 @@
 # NCP-64M
 
-A ~64M-class replication of **NCP-ArchPreview** (arXiv:2609.10715) — a latent-space
-language model that adds **Next Concept Prediction (NCP)** on top of standard
-next-token prediction (NTP). Repo layout and training pipeline follow
-[minimind](https://github.com/jingyaogong/minimind).
+**A ~64M-parameter replication of NCP-ArchPreview — latent-space language modeling with Next Concept Prediction, in the style of [MiniMind](https://github.com/jingyaogong/minimind).**
+
+[![Paper](https://img.shields.io/badge/arXiv-2609.10715-b31b1b.svg)](https://arxiv.org/abs/2609.10715)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11-blue.svg)]()
+
+[NCP-ArchPreview](https://arxiv.org/abs/2609.10715) (Intern-NCP Team, 2026) pushes
+autoregressive pretraining beyond next-token prediction: alongside NTP, the model
+learns **Next Concept Prediction (NCP)** — predicting discrete concepts that span
+multiple tokens — inside a product-quantized latent space built from its own
+hidden states. At 8.9B parameters / 5.73T tokens it reached OLMo-3-7B's final
+pretraining loss with only 51.3% of the tokens and beat its downstream
+macro-average by +2.45 (incl. +5.99 GSM8K).
+
+This repo re-implements the architecture at laptop scale (~70M params, one
+consumer GPU / Apple Silicon) with MiniMind's minimalist, from-scratch-PyTorch
+conventions: one model file, one trainer, a packed token dataset, and tests that
+actually verify the concept pathway is causal.
 
 ## Architecture
-
-Three modules around a product-quantized concept vocabulary:
 
 ```
 tokens ──> Token Encoder (3L) ──mean-pool k=4──> concepts c_m ──> Concept Module (2L, causal)
@@ -18,93 +30,146 @@ Token Decoder (3L) <────────── h_t + ĉ (repeated k×, shift
       └─> logits
 ```
 
-- **VQ concept vocabulary** — `S=6` codebooks × `N=128` codewords × 128 dims
-  (product quantization; `N^S` latent capacity). Codebook trained by
-  `L_VQ = mean ||sg(c) - d||²` — moves codebook entries toward concepts only
-  (stop-gradient on `c`), matching Eq. 21.
-- **NCP objective** — `L_NCP = mean ||ĉ_m - sg(c_m)||²` over concept positions;
-  `ĉ` is the softmax-expectation over codewords (differentiable, Eq. 8-10).
-- **Concept feedback** — each `ĉ_m` is repeated `k=4`× and shifted by `k`, so
-  position `t` predicting a token in chunk `m` sees the concept predicted from
-  chunks `< m` only (Eq. 11-12). No future leakage — enforced by a test.
-- **Hierarchical residuals** — IRC: per-layer token-conditioned weighted mix of
-  all previous depths, initialized as the plain residual `[0,…,0,1]` (Eq. 14-18).
-  CRC: Enc→CM (chunk-pooled), Enc→Dec, CM→Dec (same causal shift) — softmax
-  routing over source depths + RMSNorm + learnable diagonal scale (Eq. 19-20).
-- **Joint loss** — `L = L_NTP + α·L_NCP + β·L_VQ` (Eq. 24).
-- Backbone follows the paper's OLMo-3 recipe at small scale: RoPE (θ=5e5),
-  SwiGLU, RMSNorm(ε=1e-6), per-head QK-norm (the stable variant from §4.6),
-  every-4th-layer full attention with optional sliding window elsewhere, MHA.
+| Component | This repo (64M class) | Paper (8.9B) |
+|---|---|---|
+| Token Encoder / Concept Module / Token Decoder | 3 / 2 / 3 layers | 16 / 8 / 16 layers |
+| Hidden size, heads | 768, 12 (MHA) | 4096, 32 |
+| Concept compression `k` | 4 tokens | 4 tokens |
+| Product quantization | S=6 codebooks × N=128 × 128d | S=32 × N=128 × 128d |
+| Residual routing | IRC + CRC (all 3 paths) | IRC + CRC |
+| Optimizer | AdamW or Muon (`--optimizer`) | Moonlight Muon |
+| Total params | ~70M | 8.94B |
 
-Default config: `d=768, 3/2/3 encoder/concept/decoder layers, k=4, S=6, N=128,
-vocab=6400, tied embeddings → ~70M params` (minimind's own 768×8 counts ~68.6M
-under the same "≈64M" label).
+Mechanisms implemented faithfully to the paper's equations:
 
-### Deviations from the paper
+- **VQ concept vocabulary** — each pooled concept is split into `S` segments,
+  each assigned its nearest codeword (Eq. 3-6). `L_VQ = mean‖sg(c) − d‖²` moves
+  codebook entries toward concepts with a stop-gradient on `c`, so it never
+  distorts the token encoder (Eq. 21).
+- **NCP objective** — the Concept Module outputs a softmax distribution over
+  each codebook; `ĉ` is the expectation over codewords (fully differentiable,
+  Eq. 8-10). `L_NCP` is MSE against `sg(c)` of the *next* concept (Eq. 22).
+- **Causal concept feedback** — `ĉ_m` is repeated `k`× and shifted `k`, so the
+  position predicting a token in chunk `m` sees only concepts predicted from
+  chunks `< m` (Eq. 11-12). A test proves no future leakage.
+- **Hierarchical residuals** — IRC: token-conditioned unnormalized mix over all
+  previous depths, initialized to `[0,…,0,1]` = plain residual (Eq. 14-18).
+  CRC: Enc→CM (chunk-pooled), Enc→Dec, CM→Dec (same causal shift); softmax
+  routing over source depths, RMSNorm, learned diagonal gate (Eq. 19-20).
+- **Joint loss** — `L = L_NTP + α·L_NCP + β·L_VQ` (Eq. 24), each term logged
+  separately during training.
+- OLMo-3 backbone recipe: RoPE (θ=5e5), SwiGLU, RMSNorm(ε=1e-6), per-head
+  QK-norm (the stabilization variant identified in §4.6), every-4th-layer full
+  attention with optional sliding window.
 
-- **Concepts are RMS-normalized** (`F.rms_norm`, no params) before quantization,
-  prediction, and feedback. Without this the MSE objectives are unbounded and
-  diverge at small scale; the paper doesn't disclose its handling. A learnable
-  diagonal `concept_gain` lets the decoder set injection strength.
-- **Aux losses are elementwise-mean MSE** (paper writes segment-L2 / S; the
-  `1/seg_dim` difference is absorbed into α, β).
-- **Inference feedback uses pooled concepts** of generated chunks rather than
-  feeding predicted `ĉ` back — strictly causal and equivalent at train time;
-  the paper's predicted-feedback variant is a one-line change in `generate`.
-- α, β are not disclosed in the report; both default to 1.0 and are flags.
-
-## Layout
-
-```
-model/model_ncp.py        config + model (encoder/CM/decoder, VQ, IRC/CRC, generate)
-model/tokenizer*.json     bundled tokenizer (vocab 6400, from minimind)
-dataset/lm_dataset.py     fixed-length windows over a packed uint16 token stream
-scripts/prepare_data.py   jsonl/HF dataset -> packed .bin
-trainer/train_pretrain.py training loop (AdamW or Muon, joint loss breakdown)
-trainer/train_tokenizer.py  train a fresh BPE tokenizer on your corpus
-trainer/trainer_utils.py  Muon optimizer, lr schedule, checkpoints
-eval_llm.py               sampling/generation
-tests/test_ncp.py         shapes, causality, gradient-flow, param-count checks
-```
-
-## Usage
+## Quickstart
 
 ```bash
-uv sync                                    # or: pip install -r requirements.txt
+uv sync          # or: pip install -r requirements.txt
 
-# 1. data: local jsonl with {"text": ...} OR stream a HF dataset
+# 1) Data -> packed uint16 token stream (any jsonl {"text": ...} or a HF dataset)
 uv run python scripts/prepare_data.py \
     --hf_dataset roneneldan/TinyStories --hf_split train \
     --text_field text --max_docs 30000 --out dataset/pretrain.bin
-# minimind's own corpus: download pretrain_hq.jsonl from
-# huggingface.co/datasets/jingyaogong/minimind_dataset, then --data_path <file>
 
-# 2. train (NCP model)
+# 2) Train the NCP model
 uv run python trainer/train_pretrain.py --data_path dataset/pretrain.bin --device mps
 
-# parameter-matched vanilla baseline (paper's "Vanilla"):
-uv run python trainer/train_pretrain.py --arch vanilla --use_irc 0 --save_weight vanilla ...
-
-# paper's optimizer recipe (Muon for matrices, AdamW for the rest):
-uv run python trainer/train_pretrain.py --optimizer muon ...
-
-# ablations from Sec. 4.3.2:
-#   Vanilla+CM            -> --use_irc 0 --use_crc 0 --ncp_loss_weight 0 --vq_loss_weight 0
-#   Vanilla+CM+Residual   -> --ncp_loss_weight 0 --vq_loss_weight 0
-#   full NCP              -> defaults
-
-# 3. generate
+# 3) Generate
 uv run python eval_llm.py --weight pretrain
 
-# tests
+# Tests (causality, gradient flow, param count)
 uv run pytest tests/
 ```
 
-## Status / evidence
+minimind's own corpus also works: download `pretrain_hq.jsonl` from
+[huggingface.co/datasets/jingyaogong/minimind_dataset](https://huggingface.co/datasets/jingyaogong/minimind_dataset)
+and pass `--data_path <file>` to `prepare_data.py`.
 
-- 9/9 tests pass, including a strict no-future-leakage check on the concept path
-  and gradient-flow checks on all three objectives.
-- Short run on TinyStories (30k docs, 9.5M tokens, MPS, AdamW): NTP loss
-  6.33 → 4.31 over 150 steps; NCP/VQ losses bounded and decreasing.
-- Not yet done: a controlled NCP-vs-vanilla convergence comparison at this
-  scale, VQ-only domain adaptation (§5.1), drafter injection (§5.3).
+### Ablations (Sec. 4.3.2 of the paper)
+
+```bash
+# Vanilla — parameter-matched plain transformer baseline
+uv run python trainer/train_pretrain.py --arch vanilla --use_irc 0 --save_weight vanilla ...
+
+# Vanilla + Concept Module (no residual routing, no NCP loss)
+... --use_irc 0 --use_crc 0 --ncp_loss_weight 0 --vq_loss_weight 0
+
+# Vanilla + CM + Residual (routing but no NCP supervision)
+... --ncp_loss_weight 0 --vq_loss_weight 0
+
+# Full NCP-ArchPreview — defaults
+```
+
+`--optimizer muon` applies the paper's recipe: Muon for matrix parameters,
+AdamW for embeddings/heads/codebook.
+
+## Verification evidence
+
+| Check | Result |
+|---|---|
+| Unit tests | 9/9 pass — forward shapes, joint-loss identity, **strict no-future-leakage** through the concept path, VQ→codebook-only grads, NCP→CM+encoder grads |
+| Concept-channel isolation | with `sliding_window=4`, a perturbation in chunk 0 changes distant logits only via the concept pathway |
+| Short pretraining run | TinyStories 30k docs / 9.5M tokens on Apple MPS, AdamW: `ntp 6.33 → 4.31` over 150 steps, `ncp`/`vq` bounded and decreasing |
+| Generation | `eval_llm.py` produces continuations end-to-end (early-checkpoint gibberish, as expected) |
+
+## Deviations from the paper
+
+- **Concepts are RMS-normalized** (parameter-free) before quantization,
+  prediction, and feedback. The paper doesn't disclose its scale handling;
+  without it the MSE objectives are unbounded and diverge at small scale.
+  A learnable diagonal `concept_gain` lets the decoder set injection strength.
+- **Aux losses use elementwise-mean MSE** — the paper's segment-L2/S convention
+  differs by a constant `seg_dim` factor, absorbed into α/β.
+- **α, β are undisclosed** — both default to 1.0 and are CLI flags.
+- **Inference feeds pooled concepts** of completed generated chunks rather than
+  predicted `ĉ` back autoregressively — strictly causal; the paper's variant is
+  a one-line change in `generate`.
+- Per-head QK-norm (used by MiniMind) replaces OLMo-3's layer-wise QK-norm —
+  this is the variant the paper itself found *more* stable under Muon (§4.6).
+
+## Roadmap
+
+- [ ] Controlled NCP-vs-vanilla convergence comparison at 64M (the paper's
+      headline 1.95× speedup claim)
+- [ ] VQ-only domain adaptation — freeze the backbone, train only codebooks +
+      prediction heads (§5.1)
+- [ ] Concept injection into a block-parallel speculative drafter (§5.3)
+- [ ] KV-cache generation (currently full-forward per step — simple and correct
+      at this scale)
+
+## Repository layout
+
+```
+model/model_ncp.py          config + model: encoder/CM/decoder, PQ-VQ, IRC/CRC, generate
+model/tokenizer*.json       bundled BPE tokenizer (vocab 6400, from MiniMind)
+dataset/lm_dataset.py       fixed-length windows over a packed token stream
+scripts/prepare_data.py     jsonl / HF dataset -> packed .bin
+trainer/train_pretrain.py   training loop (AdamW|Muon, per-loss logging, resume)
+trainer/train_tokenizer.py  train a fresh BPE tokenizer on your own corpus
+trainer/trainer_utils.py    Muon optimizer, lr schedule, checkpointing
+eval_llm.py                 sampling / generation
+tests/test_ncp.py           causality, gradient-flow, param-count checks
+```
+
+## Citation
+
+```bibtex
+@article{ncp-archpreview-2026,
+  title   = {NCP-ArchPreview Technical Report: Moving towards Latent Space
+             Language Models through Next Concept Prediction},
+  author  = {{The Intern-NCP Team}},
+  journal = {arXiv:2609.10715},
+  year    = {2026}
+}
+```
+
+## Acknowledgments
+
+- [NCP-ArchPreview](https://arxiv.org/abs/2609.10715) — the paper this replicates
+- [MiniMind](https://github.com/jingyaogong/minimind) — repo layout, trainer
+  conventions, and the bundled tokenizer (`model/tokenizer*.json`, Apache-2.0)
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
