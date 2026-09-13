@@ -63,6 +63,8 @@ def scalar_metrics(res, lr):
         'model/logit_absmax': res['logits'].detach().abs().max().item(),
         'model/hidden_rms': res['hidden_states'].detach().float().pow(2).mean().sqrt().item(),
     }
+    if res['logits'].is_cuda:
+        m['perf/gpu_mem_gb'] = torch.cuda.max_memory_allocated() / 2**30
     if res.get('loss_ncp') is not None:
         m['loss/ncp'] = res['loss_ncp'].item()
         m['loss/vq'] = res['loss_vq'].item()
@@ -357,6 +359,8 @@ def eval_split(model, ds, eval_idx, batch_size, device, autocast_ctx, max_batche
                 res = model(x, labels=y)
             agg['loss'] += res['loss'].item()
             agg['ntp'] += res['loss_ntp'].item()
+            mask = y != -100
+            agg['acc'] += (res['logits'].argmax(-1)[mask] == y[mask]).float().mean().item()
             if res.get('loss_ncp') is not None:
                 agg['ncp'] += res['loss_ncp'].item()
                 agg['vq'] += res['loss_vq'].item()
@@ -463,10 +467,15 @@ class WandbMonitor:
         if a.diag_interval > 0 and self.opt_step % a.diag_interval == 0:
             self.run.log(self._diagnostics(input_ids, labels, lr), step=self.micro_step)
         if self.eval_idx and a.eval_interval > 0 and self.opt_step % a.eval_interval == 0:
-            self.run.log(eval_split(self.model, self.val_ds, self.eval_idx,
-                                    min(a.batch_size, 32),  # probes run eager — cap the activation spike
-                                    self.device, self.autocast_ctx, a.eval_batches),
-                         step=self.micro_step)
+            vm = eval_split(self.model, self.val_ds, self.eval_idx,
+                            min(a.batch_size, 32),  # probes run eager — cap the activation spike
+                            self.device, self.autocast_ctx, a.eval_batches)
+            self.run.log(vm, step=self.micro_step)
+            for k, v in vm.items():
+                best = f'best_{k}'
+                prev = self.run.summary.get(best)
+                if prev is None or (v > prev if k.endswith('/acc') else v < prev):
+                    self.run.summary[best] = v
         if a.showcase_interval > 0 and self.opt_step % a.showcase_interval == 0:
             self.run.log(self._showcase(), step=self.micro_step)
 
