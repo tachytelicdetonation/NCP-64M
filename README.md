@@ -101,8 +101,9 @@ uv run python trainer/train_pretrain.py --arch vanilla --use_irc 0 --save_weight
 # Full NCP-ArchPreview — defaults
 ```
 
-`--optimizer muon` applies the paper's recipe: Muon for matrix parameters,
-AdamW for embeddings/heads/codebook.
+The default `--optimizer muon` applies the paper's recipe (Moonlight): Muon for
+matrix parameters, AdamW for embeddings/heads/codebook. Pass `--optimizer adamw`
+for a pure AdamW baseline.
 
 ## Monitoring (wandb)
 
