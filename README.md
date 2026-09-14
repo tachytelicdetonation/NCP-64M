@@ -227,6 +227,27 @@ teacher-forces encoder-pooled concepts instead.
 | Short pretraining run | TinyStories 30k docs / 9.5M tokens on Apple MPS, AdamW: `ntp 6.73 → 3.89` over 150 steps, `ncp`/`vq` bounded and decreasing |
 | Generation | `eval_llm.py` produces continuations end-to-end (early-checkpoint gibberish, as expected) |
 
+## Results — 1.6B-token pretraining (RTX 3090, ~3.7h)
+
+Trained one epoch over the [1.6B-token mix](https://huggingface.co/datasets/tachytelicdetonation/ncp-1p6b-mix)
+with Muon + BF16 + `max-autotune-no-cudagraphs` (~120k tok/s, ~72% MFU).
+Final: **val ppl 7.88, val acc 55.1%, OOD FineWiki ppl 8.13**, train↔val gap ≈ 0.
+
+Zero-shot vs MiniMind-3 (`pretrain_768.pth`, same likelihood-scoring script, n=400 each):
+
+| Task | NCP-64M acc_norm | MiniMind-3 acc_norm |
+|---|---|---|
+| BoolQ | 0.360 | 0.360 |
+| PIQA | **0.580** | 0.537 |
+| ARC-Easy | **0.295** | 0.255 |
+| OpenBookQA | 0.270 | 0.260 |
+| WinoGrande | **0.527** | 0.490 |
+| HellaSwag | 0.328 | **0.345** |
+| **mean** | **0.393** | 0.375 |
+
+Artifacts: model [`tachytelicdetonation/ncp-64m`](https://huggingface.co/tachytelicdetonation/ncp-64m)
+(loads via `trust_remote_code`), dataset above, full curves in wandb `ncp-pretrain/ncp-1p6b`.
+
 ## Deviations from the paper
 
 - **Concepts are RMS-normalized** (parameter-free) before quantization,
